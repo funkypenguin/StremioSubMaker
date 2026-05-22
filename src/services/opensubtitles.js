@@ -18,10 +18,7 @@ const OPENSUBTITLES_VIP_API_URL = 'https://vip-api.opensubtitles.com/api/v1';
 const USER_AGENT = `SubMaker v${version}`;
 const MAX_ZIP_BYTES = 25 * 1024 * 1024; // hard cap for ZIP downloads (~25MB) to avoid huge packs
 
-const AUTH_FAILURE_TTL_MS = Math.max(
-  30 * 1000,
-  parseInt(process.env.OPENSUBTITLES_AUTH_FAILURE_TTL_MS || String(5 * 60 * 1000), 10) || (5 * 60 * 1000)
-); // Keep invalid credentials blocked briefly; config edits change the credential hash
+const AUTH_FAILURE_TTL_MS = 30 * 1000; // Keep invalid credentials blocked briefly
 const credentialFailureCache = new Map();
 const AUTH_FAILURE_PREFIX = 'osauthfail:';
 
@@ -77,22 +74,6 @@ const RATE_LIMIT_HEADER_REMAINING_FLOOR = Math.max(
   0,
   parseInt(process.env.OPENSUBTITLES_HEADER_REMAINING_FLOOR || '0', 10) || 0
 );
-const LOGIN_RATE_LIMIT_BACKOFF_MIN_MS = Math.max(
-  60000,
-  parseInt(process.env.OPENSUBTITLES_LOGIN_BACKOFF_MIN_MS || '60000', 10) || 60000
-);
-const LOGIN_RATE_LIMIT_BACKOFF_MAX_MS = Math.max(
-  LOGIN_RATE_LIMIT_BACKOFF_MIN_MS,
-  parseInt(process.env.OPENSUBTITLES_LOGIN_BACKOFF_MAX_MS || String(15 * 60 * 1000), 10) || (15 * 60 * 1000)
-);
-const LOGIN_RATE_LIMIT_BACKOFF_JITTER_MS = Math.max(
-  0,
-  parseInt(process.env.OPENSUBTITLES_LOGIN_BACKOFF_JITTER_MS || '5000', 10) || 5000
-);
-const LOGIN_RATE_LIMIT_BACKOFF_TTL_MS = Math.max(
-  LOGIN_RATE_LIMIT_BACKOFF_MAX_MS + 60000,
-  parseInt(process.env.OPENSUBTITLES_LOGIN_BACKOFF_TTL_MS || String(16 * 60 * 1000), 10) || (16 * 60 * 1000)
-);
 const LOGIN_SINGLEFLIGHT_LOCK_TTL_MS = Math.max(
   5000,
   parseInt(process.env.OPENSUBTITLES_LOGIN_LOCK_TTL_MS || '30000', 10) || 30000
@@ -105,8 +86,6 @@ const LOGIN_SINGLEFLIGHT_POLL_MS = Math.max(
 // Cluster/Sentinel deployments, so the multi-key Lua reservation remains valid.
 const DISTRIBUTED_RATE_LIMIT_KEY = '{opensubtitles}:api_next_at';
 const DISTRIBUTED_LOGIN_SEND_RATE_LIMIT_KEY = '{opensubtitles}:login_next_at';
-const DISTRIBUTED_LOGIN_BACKOFF_KEY = '{opensubtitles}:login_backoff_until';
-const DISTRIBUTED_LOGIN_BACKOFF_FAILURES_KEY = '{opensubtitles}:login_backoff_failures';
 const DISTRIBUTED_LOGIN_SINGLEFLIGHT_PREFIX = '{opensubtitles}:login_singleflight:';
 const DISTRIBUTED_RATE_LIMIT_TTL_MS = Math.max(60000, RATE_LIMIT_MIN_INTERVAL_MS * 16);
 const DISTRIBUTED_LOGIN_SEND_RATE_LIMIT_TTL_MS = Math.max(60000, LOGIN_MIN_INTERVAL_MS * 16);
@@ -114,8 +93,6 @@ let _localApiNextAllowedAt = 0;
 let _localLoginNextAllowedAt = 0;
 let _localRateLimitQueue = Promise.resolve();
 let _lastDistributedLimiterWarningAt = 0;
-let _localLoginBackoffUntil = 0;
-let _localLoginBackoffFailures = 0;
 const localLoginSingleflightLocks = new Map();
 
 function sleep(ms) {
@@ -200,12 +177,6 @@ function getSessionRedisKey(adapter, key) {
   return adapter._getKey(key, StorageAdapter.CACHE_TYPES.SESSION);
 }
 
-function clampLoginBackoffDelay(ms) {
-  const parsed = Number(ms);
-  const baseMs = Number.isFinite(parsed) && parsed > 0 ? parsed : LOGIN_RATE_LIMIT_BACKOFF_MIN_MS;
-  return Math.max(LOGIN_RATE_LIMIT_BACKOFF_MIN_MS, Math.min(Math.ceil(baseMs), LOGIN_RATE_LIMIT_BACKOFF_MAX_MS));
-}
-
 function readLocalLoginSingleflightLock(lockKey) {
   const existing = localLoginSingleflightLocks.get(lockKey);
   if (!existing) {
@@ -222,128 +193,6 @@ function readLocalLoginSingleflightLock(lockKey) {
 
 function buildLoginSingleflightLockKey(credentialsCacheKey) {
   return `lock:${DISTRIBUTED_LOGIN_SINGLEFLIGHT_PREFIX}${credentialsCacheKey}`;
-}
-
-async function getOpenSubtitlesLoginBackoff(options = {}) {
-  const localRemainingMs = Math.max(0, Math.ceil(_localLoginBackoffUntil - Date.now()));
-
-  const adapter = await getOpenSubtitlesRedisAdapter(options);
-  if (!adapter) {
-    return localRemainingMs;
-  }
-
-  try {
-    const key = getSessionRedisKey(adapter, `ratelimit:${DISTRIBUTED_LOGIN_BACKOFF_KEY}`);
-    const until = Number(await adapter.client.get(key) || '0');
-    const remainingMs = Math.max(0, Math.ceil(until - Date.now()));
-    if (remainingMs <= 0) {
-      return localRemainingMs;
-    }
-    return Math.max(localRemainingMs, remainingMs);
-  } catch (error) {
-    log.debug(() => `[OpenSubtitles] Failed to read distributed login backoff: ${error.message}`);
-    return localRemainingMs;
-  }
-}
-
-async function clearOpenSubtitlesLoginBackoff(options = {}) {
-  _localLoginBackoffUntil = 0;
-  _localLoginBackoffFailures = 0;
-
-  const adapter = await getOpenSubtitlesRedisAdapter(options);
-  if (!adapter) {
-    return false;
-  }
-
-  try {
-    const backoffKey = getSessionRedisKey(adapter, `ratelimit:${DISTRIBUTED_LOGIN_BACKOFF_KEY}`);
-    const failuresKey = getSessionRedisKey(adapter, `ratelimit:${DISTRIBUTED_LOGIN_BACKOFF_FAILURES_KEY}`);
-    await adapter.client.del(backoffKey, failuresKey);
-    return true;
-  } catch (error) {
-    log.debug(() => `[OpenSubtitles] Failed to clear distributed login backoff: ${error.message}`);
-    return false;
-  }
-}
-
-async function recordOpenSubtitlesLoginRateLimit(waitMs, reason = 'login rate limit', options = {}) {
-  const jitterMs = LOGIN_RATE_LIMIT_BACKOFF_JITTER_MS > 0
-    ? Math.floor(Math.random() * LOGIN_RATE_LIMIT_BACKOFF_JITTER_MS)
-    : 0;
-  const baseDelayMs = clampLoginBackoffDelay(waitMs) + jitterMs;
-  const maxDelayMs = LOGIN_RATE_LIMIT_BACKOFF_MAX_MS;
-  const ttlMs = LOGIN_RATE_LIMIT_BACKOFF_TTL_MS;
-
-  const adapter = await getOpenSubtitlesRedisAdapter(options);
-  if (!adapter) {
-    _localLoginBackoffFailures += 1;
-    const multiplier = Math.pow(2, Math.min(_localLoginBackoffFailures - 1, 8));
-    const delayMs = Math.min(maxDelayMs, baseDelayMs * multiplier);
-    _localLoginBackoffUntil = Math.max(_localLoginBackoffUntil, Date.now() + delayMs);
-    log.warn(() => `[OpenSubtitles] Local login backoff after ${reason}: ${delayMs}ms (Redis unavailable)`);
-    return Math.max(0, Math.ceil(_localLoginBackoffUntil - Date.now()));
-  }
-
-  try {
-    const backoffKey = getSessionRedisKey(adapter, `ratelimit:${DISTRIBUTED_LOGIN_BACKOFF_KEY}`);
-    const failuresKey = getSessionRedisKey(adapter, `ratelimit:${DISTRIBUTED_LOGIN_BACKOFF_FAILURES_KEY}`);
-    const result = await adapter.client.eval(`
-      local timeParts = redis.call('time')
-      local nowMs = (tonumber(timeParts[1]) * 1000) + math.floor(tonumber(timeParts[2]) / 1000)
-      local baseDelayMs = tonumber(ARGV[1])
-      local maxDelayMs = tonumber(ARGV[2])
-      local ttlMs = tonumber(ARGV[3])
-      local failures = tonumber(redis.call('get', KEYS[2]) or '0') + 1
-      redis.call('psetex', KEYS[2], ttlMs, failures)
-
-      local exponent = failures - 1
-      if exponent > 8 then
-        exponent = 8
-      end
-
-      local delayMs = baseDelayMs * (2 ^ exponent)
-      if delayMs > maxDelayMs then
-        delayMs = maxDelayMs
-      end
-
-      local targetUntil = nowMs + delayMs
-      local currentUntil = tonumber(redis.call('get', KEYS[1]) or '0')
-      if currentUntil < targetUntil then
-        redis.call('psetex', KEYS[1], ttlMs, targetUntil)
-        return {delayMs, targetUntil, failures}
-      end
-
-      return {math.max(0, math.ceil(currentUntil - nowMs)), currentUntil, failures}
-    `, 2, backoffKey, failuresKey, baseDelayMs, maxDelayMs, ttlMs);
-
-    const delayMs = Math.max(0, Math.ceil(Number(result?.[0]) || baseDelayMs));
-    const until = Number(result?.[1]) || (Date.now() + delayMs);
-    const failures = Number(result?.[2]) || 1;
-    _localLoginBackoffUntil = Math.max(_localLoginBackoffUntil, until);
-    _localLoginBackoffFailures = Math.max(_localLoginBackoffFailures, failures);
-    log.warn(() => `[OpenSubtitles] Distributed login backoff after ${reason}: ${delayMs}ms (failure #${failures})`);
-    return delayMs;
-  } catch (error) {
-    log.warn(() => `[OpenSubtitles] Failed to record distributed login backoff after ${reason}: ${error.message}`);
-    _localLoginBackoffFailures += 1;
-    const delayMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, Math.min(_localLoginBackoffFailures - 1, 8)));
-    _localLoginBackoffUntil = Math.max(_localLoginBackoffUntil, Date.now() + delayMs);
-    return Math.max(0, Math.ceil(_localLoginBackoffUntil - Date.now()));
-  }
-}
-
-function createLoginBackoffError(retryAfterMs, context = 'login backoff') {
-  return createOpenSubtitlesRateLimitError(
-    `OpenSubtitles login is temporarily cooling down after upstream rate limiting (${context})`,
-    retryAfterMs
-  );
-}
-
-async function assertOpenSubtitlesLoginBackoffClear(context = 'login', options = {}) {
-  const retryAfterMs = await getOpenSubtitlesLoginBackoff(options);
-  if (retryAfterMs > 0) {
-    throw createLoginBackoffError(retryAfterMs, context);
-  }
 }
 
 async function tryAcquireDistributedLoginSingleflightLock(credentialsCacheKey, options = {}) {
@@ -870,17 +719,8 @@ async function noteOpenSubtitlesRateLimit(error, context) {
   );
   const effectiveWaitMs = getRateLimitDelayMs(waitMs);
 
-  if (context === 'login') {
-    await applyDistributedRateLimitDelay(effectiveWaitMs, `${context} upstream 429`, {
-      includeLogin: true
-    });
-    const loginBackoffMs = await recordOpenSubtitlesLoginRateLimit(effectiveWaitMs, `${context} upstream 429`);
-    log.warn(() => `[OpenSubtitles] Upstream 429 from ${context} despite preflight limiter; login refreshes backed off by ${loginBackoffMs}ms`);
-    return loginBackoffMs;
-  }
-
   await applyDistributedRateLimitDelay(effectiveWaitMs, `${context} upstream 429`, {
-    includeLogin: false
+    includeLogin: context === 'login'
   });
   log.warn(() => `[OpenSubtitles] Upstream 429 from ${context} despite preflight limiter; advanced next reservation by ${effectiveWaitMs}ms`);
   return effectiveWaitMs;
@@ -937,8 +777,6 @@ function resetRateLimiterState() {
   _localLoginNextAllowedAt = 0;
   _localRateLimitQueue = Promise.resolve();
   _lastDistributedLimiterWarningAt = 0;
-  _localLoginBackoffUntil = 0;
-  _localLoginBackoffFailures = 0;
   localLoginSingleflightLocks.clear();
 }
 // ─── End rate limiter ─────────────────────────────────────────────────────────
@@ -1404,10 +1242,6 @@ class OpenSubtitlesService {
 
       log.debug(() => '[OpenSubtitles] User authentication successful');
       await clearCachedAuthFailure(this.credentialsCacheKey);
-      const activeBackoffMs = await getOpenSubtitlesLoginBackoff();
-      if (activeBackoffMs <= 0) {
-        await clearOpenSubtitlesLoginBackoff();
-      }
       return this.token;
 
     } catch (error) {
@@ -1426,13 +1260,12 @@ class OpenSubtitlesService {
           RATE_LIMIT_RETRY_AFTER_MAX_MS
         );
         await applyDistributedRateLimitDelay(retryAfterMs, 'login 403 rate-limit-like response', { includeLogin: true });
-        const loginBackoffMs = await recordOpenSubtitlesLoginRateLimit(retryAfterMs, 'login 403 rate-limit-like response');
         const e = new Error('OpenSubtitles API key temporarily blocked due to rate limiting');
         e.statusCode = 429;
         e.type = 'rate_limit';
         e.isRetryable = true;
         e.openSubtitlesRateLimit = true;
-        e.retryAfterMs = loginBackoffMs;
+        e.retryAfterMs = retryAfterMs;
         throw e;
       }
 
@@ -1528,11 +1361,6 @@ class OpenSubtitlesService {
         throw this._createAuthFailureError();
       }
 
-      const backoffMs = await getOpenSubtitlesLoginBackoff();
-      if (backoffMs > 0) {
-        throw createLoginBackoffError(backoffMs, 'singleflight waiter');
-      }
-
       const lockTtlMs = await getDistributedLoginSingleflightLockTtl(this.credentialsCacheKey);
       if (lockTtlMs <= 0) {
         return null;
@@ -1568,8 +1396,6 @@ class OpenSubtitlesService {
         return this._applyCachedToken(cached, 'cross-pod cache');
       }
 
-      await assertOpenSubtitlesLoginBackoffClear('before login refresh');
-
       const remainingMs = Math.max(0, deadlineAt - Date.now());
       const lock = await tryAcquireDistributedLoginSingleflightLock(this.credentialsCacheKey, {
         ttlMs: Math.max(LOGIN_SINGLEFLIGHT_LOCK_TTL_MS, remainingMs + 2000)
@@ -1577,7 +1403,6 @@ class OpenSubtitlesService {
 
       if (lock.acquired) {
         try {
-          await assertOpenSubtitlesLoginBackoffClear('login owner');
           const cachedAfterLock = await getCachedToken(this.credentialsCacheKey);
           if (cachedAfterLock) {
             return this._applyCachedToken(cachedAfterLock, 'cache after login lock');
@@ -1695,7 +1520,7 @@ class OpenSubtitlesService {
       }
 
       if (await this.isTokenExpired()) {
-        // login() coordinates Redis singleflight/backoff and throws typed
+        // login() coordinates Redis singleflight and throws typed
         // transient errors so orchestration does not cache incomplete results.
         const loginResult = await this.login(providerTimeout);
 
@@ -2480,11 +2305,8 @@ module.exports.__testing = {
   applyDistributedRateLimitDelay,
   buildOpenSubtitlesQueryString,
   createOpenSubtitlesRateLimitError,
-  clearOpenSubtitlesLoginBackoff,
-  getOpenSubtitlesLoginBackoff,
   keepAliveOpenSubtitlesAuthApi,
   isOpenSubtitlesRateLimitError,
-  recordOpenSubtitlesLoginRateLimit,
   requestOpenSubtitlesApi,
   resolveRateLimitDeadline,
   releaseDistributedLoginSingleflightLock,

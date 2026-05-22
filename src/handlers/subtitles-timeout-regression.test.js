@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   collectProviderSearchResults,
@@ -15,6 +17,15 @@ function makeSubtitle(id, languageCode) {
     provider: 'test'
   };
 }
+
+test('subtitle handler does not define route/cache fallback timeout knobs', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'subtitles.js'), 'utf8');
+
+  assert.equal(source.includes('SUBTITLE_ROUTE_FALLBACK_TIMEOUT_MS'), false);
+  assert.equal(source.includes('SUBTITLE_CACHE_PHASE_TIMEOUT_MS'), false);
+  assert.equal(source.includes('withFallbackTimeout'), false);
+  assert.equal(source.includes('continuing with fallback'), false);
+});
 
 test('provider search timeout marks returned results as partial', async () => {
   const results = await collectProviderSearchResults([
