@@ -18,7 +18,7 @@ const OPENSUBTITLES_VIP_API_URL = 'https://vip-api.opensubtitles.com/api/v1';
 const USER_AGENT = `SubMaker v${version}`;
 const MAX_ZIP_BYTES = 25 * 1024 * 1024; // hard cap for ZIP downloads (~25MB) to avoid huge packs
 
-const AUTH_FAILURE_TTL_MS = 30 * 1000; // Keep invalid credentials blocked briefly
+const AUTH_FAILURE_TTL_MS = 10 * 60 * 1000; // Suppress repeated bad-credential logins for 10 minutes
 const credentialFailureCache = new Map();
 const AUTH_FAILURE_PREFIX = 'osauthfail:';
 
@@ -2286,6 +2286,7 @@ module.exports.keepAliveOpenSubtitlesAuthApi = keepAliveOpenSubtitlesAuthApi;
 module.exports.__testing = {
   acquireToken,
   applyDistributedRateLimitDelay,
+  AUTH_FAILURE_TTL_MS,
   buildOpenSubtitlesQueryString,
   createOpenSubtitlesRateLimitError,
   createOpenSubtitlesQueueBusyError,

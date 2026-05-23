@@ -31,6 +31,203 @@ test('OpenSubtitles Auth does not define login backoff/cooldown controls', () =>
   assert.equal('clearOpenSubtitlesLoginBackoff' in exportedTestingApi, false);
 });
 
+test('OpenSubtitles Auth caches invalid credentials for 10 minutes', () => {
+  const OpenSubtitlesService = require('./opensubtitles');
+  assert.equal(OpenSubtitlesService.__testing.AUTH_FAILURE_TTL_MS, 10 * 60 * 1000);
+});
+
+test('SubDL caches invalid API keys and blocks repeated searches', async () => {
+  const sharedCache = require('../utils/sharedCache');
+  const {
+    resetProviderAuthFailureCache,
+    PROVIDER_AUTH_FAILURE_TTL_MS
+  } = require('../utils/providerAuthFailureCache');
+  const SubDLService = require('./subdl');
+  const originalGetShared = sharedCache.getShared;
+  const originalSetShared = sharedCache.setShared;
+  const originalDeleteShared = sharedCache.deleteShared;
+
+  sharedCache.getShared = async () => null;
+  sharedCache.setShared = async () => true;
+  sharedCache.deleteShared = async () => true;
+  resetProviderAuthFailureCache();
+
+  try {
+    assert.equal(PROVIDER_AUTH_FAILURE_TTL_MS, 10 * 60 * 1000);
+
+    const service = new SubDLService('bad-subdl-key');
+    let searchCalls = 0;
+    service.client = {
+      get: async () => {
+        searchCalls += 1;
+        const error = new Error('Request failed with status code 403');
+        error.response = {
+          status: 403,
+          data: { message: 'Not Authorized', status: false }
+        };
+        throw error;
+      }
+    };
+
+    const params = {
+      imdb_id: 'tt1234567',
+      type: 'movie',
+      languages: ['eng'],
+      providerTimeout: 1000
+    };
+
+    assert.deepEqual(await service.searchSubtitles(params), []);
+    assert.equal(searchCalls, 1);
+
+    assert.deepEqual(await service.searchSubtitles(params), []);
+    assert.equal(searchCalls, 1);
+  } finally {
+    resetProviderAuthFailureCache();
+    sharedCache.getShared = originalGetShared;
+    sharedCache.setShared = originalSetShared;
+    sharedCache.deleteShared = originalDeleteShared;
+  }
+});
+
+test('Wyzie caches invalid API keys and blocks repeated searches', async () => {
+  const sharedCache = require('../utils/sharedCache');
+  const { resetProviderAuthFailureCache } = require('../utils/providerAuthFailureCache');
+  const WyzieSubsService = require('./wyzieSubs');
+  const originalGetShared = sharedCache.getShared;
+  const originalSetShared = sharedCache.setShared;
+  const originalDeleteShared = sharedCache.deleteShared;
+
+  sharedCache.getShared = async () => null;
+  sharedCache.setShared = async () => true;
+  sharedCache.deleteShared = async () => true;
+  resetProviderAuthFailureCache();
+
+  try {
+    const service = new WyzieSubsService('bad-wyzie-key');
+    let searchCalls = 0;
+    service.client = {
+      get: async () => {
+        searchCalls += 1;
+        const error = new Error('Request failed with status code 403');
+        error.response = {
+          status: 403,
+          data: { details: 'Invalid API key' }
+        };
+        throw error;
+      }
+    };
+
+    const params = {
+      imdb_id: 'tt1234567',
+      type: 'movie',
+      languages: ['eng'],
+      sources: { opensubtitles: true },
+      providerTimeout: 1000
+    };
+
+    assert.deepEqual(await service.searchSubtitles(params), []);
+    assert.equal(searchCalls, 1);
+
+    assert.deepEqual(await service.searchSubtitles(params), []);
+    assert.equal(searchCalls, 1);
+  } finally {
+    resetProviderAuthFailureCache();
+    sharedCache.getShared = originalGetShared;
+    sharedCache.setShared = originalSetShared;
+    sharedCache.deleteShared = originalDeleteShared;
+  }
+});
+
+test('OpenAI-compatible model fetch caches invalid API keys', async () => {
+  const axios = require('axios');
+  const sharedCache = require('../utils/sharedCache');
+  const { resetProviderAuthFailureCache } = require('../utils/providerAuthFailureCache');
+  const OpenAICompatibleProvider = require('./providers/openaiCompatible');
+  const originalAxiosGet = axios.get;
+  const originalGetShared = sharedCache.getShared;
+  const originalSetShared = sharedCache.setShared;
+  const originalDeleteShared = sharedCache.deleteShared;
+
+  sharedCache.getShared = async () => null;
+  sharedCache.setShared = async () => true;
+  sharedCache.deleteShared = async () => true;
+  resetProviderAuthFailureCache();
+
+  try {
+    let modelCalls = 0;
+    axios.get = async () => {
+      modelCalls += 1;
+      const error = new Error('Request failed with status code 401');
+      error.response = {
+        status: 401,
+        data: { error: { message: 'Invalid API key' } }
+      };
+      throw error;
+    };
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'bad-openai-key',
+      providerName: 'openai',
+      baseUrl: 'https://api.openai.com/v1'
+    });
+
+    assert.deepEqual(await provider.getAvailableModels(), []);
+    assert.equal(modelCalls, 1);
+
+    assert.deepEqual(await provider.getAvailableModels(), []);
+    assert.equal(modelCalls, 1);
+  } finally {
+    axios.get = originalAxiosGet;
+    resetProviderAuthFailureCache();
+    sharedCache.getShared = originalGetShared;
+    sharedCache.setShared = originalSetShared;
+    sharedCache.deleteShared = originalDeleteShared;
+  }
+});
+
+test('Gemini model fetch caches invalid API keys', async () => {
+  const axios = require('axios');
+  const sharedCache = require('../utils/sharedCache');
+  const { resetProviderAuthFailureCache } = require('../utils/providerAuthFailureCache');
+  const GeminiService = require('./gemini');
+  const originalAxiosGet = axios.get;
+  const originalGetShared = sharedCache.getShared;
+  const originalSetShared = sharedCache.setShared;
+  const originalDeleteShared = sharedCache.deleteShared;
+
+  sharedCache.getShared = async () => null;
+  sharedCache.setShared = async () => true;
+  sharedCache.deleteShared = async () => true;
+  resetProviderAuthFailureCache();
+
+  try {
+    let modelCalls = 0;
+    axios.get = async () => {
+      modelCalls += 1;
+      const error = new Error('API key not valid');
+      error.response = {
+        status: 400,
+        data: { error: { message: 'API key not valid. Please pass a valid API key.' } }
+      };
+      throw error;
+    };
+
+    const gemini = new GeminiService('bad-gemini-key', 'gemini-flash-lite-latest');
+
+    assert.deepEqual(await gemini.getAvailableModels(), []);
+    assert.equal(modelCalls, 1);
+
+    assert.deepEqual(await gemini.getAvailableModels(), []);
+    assert.equal(modelCalls, 1);
+  } finally {
+    axios.get = originalAxiosGet;
+    resetProviderAuthFailureCache();
+    sharedCache.getShared = originalGetShared;
+    sharedCache.setShared = originalSetShared;
+    sharedCache.deleteShared = originalDeleteShared;
+  }
+});
+
 test('OpenSubtitles Auth reuses a valid JWT for search without logging in', async () => {
   const sharedCache = require('../utils/sharedCache');
   const OpenSubtitlesService = require('./opensubtitles');
